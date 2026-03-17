@@ -36,13 +36,6 @@ bool nestedEpollWorks(LoggerPtr log)
     return true;
 }
 
-/// See also QUERY_PROFILER_DEFAULT_SAMPLE_RATE_NS in Core/Defines.h
-#if !defined(SANITIZER)
-bool queryProfilerWorks() { return true; }
-#else
-bool queryProfilerWorks() { return false; }
-#endif
-
 }
 
 namespace DB
@@ -87,22 +80,6 @@ void applySettingsQuirks(Settings & settings, LoggerPtr log)
             settings[Setting::use_hedged_requests] = false;
             if (log)
                 LOG_WARNING(log, "use_hedged_requests has been disabled (you can explicitly enable it still)");
-        }
-    }
-
-    if (!queryProfilerWorks())
-    {
-        if (settings[Setting::query_profiler_real_time_period_ns])
-        {
-            settings[Setting::query_profiler_real_time_period_ns] = 0;
-            if (log)
-                LOG_WARNING(log, "query_profiler_real_time_period_ns has been disabled (due to server had been compiled with sanitizers)");
-        }
-        if (settings[Setting::query_profiler_cpu_time_period_ns])
-        {
-            settings[Setting::query_profiler_cpu_time_period_ns] = 0;
-            if (log)
-                LOG_WARNING(log, "query_profiler_cpu_time_period_ns has been disabled (due to server had been compiled with sanitizers)");
         }
     }
 }

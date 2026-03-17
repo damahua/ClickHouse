@@ -26,6 +26,10 @@
 
 #include <boost/algorithm/string/split.hpp>
 
+#if defined(SANITIZER)
+#include <absl/debugging/stacktrace.h>
+#endif
+
 #if defined(OS_DARWIN)
 /// This header contains functions like `backtrace` and `backtrace_symbols`
 /// Which will be used for stack unwinding on Mac.
@@ -280,6 +284,7 @@ std::string getSignalCodeDescription(int sig, int si_code)
     }
 }
 
+[[maybe_unused]]
 static void * getCallerAddress(const ucontext_t & context)
 {
 #if defined(__x86_64__)
@@ -469,10 +474,21 @@ void StackTrace::forEachFrame(
 
 StackTrace::StackTrace(const ucontext_t & signal_context)
 {
-    tryCapture();
-
     /// This variable from signal handler is not instrumented by Memory Sanitizer.
     __msan_unpoison(&signal_context, sizeof(signal_context));
+
+#if defined(SANITIZER)
+    /// Under sanitizers, use abseil's frame-pointer-based unwinding instead of libunwind.
+    /// Abseil's GetStackTraceWithContext is async-signal-safe and handles signal trampolines
+    /// (VDSO __kernel_rt_sigreturn) to correctly unwind through the signal boundary.
+    /// libunwind's async unwinding is not compatible with sanitizer internals.
+    int captured = absl::GetStackTraceWithContext(
+        frame_pointers.data(), static_cast<int>(FRAMEPOINTER_CAPACITY),
+        /* skip_count= */ 0, &signal_context, nullptr);
+    size = captured > 0 ? static_cast<size_t>(captured) : 0;
+    __msan_unpoison(frame_pointers.data(), size * sizeof(frame_pointers[0]));
+#else
+    tryCapture();
 
     void * caller_address = getCallerAddress(signal_context);
 
@@ -496,6 +512,7 @@ StackTrace::StackTrace(const ucontext_t & signal_context)
             }
         }
     }
+#endif
 }
 
 StackTrace::StackTrace(FramePointers frame_pointers_, size_t size_, size_t offset_)
@@ -508,6 +525,11 @@ void StackTrace::tryCapture()
 {
 #if defined(OS_DARWIN)
     size = backtrace(frame_pointers.data(), FRAMEPOINTER_CAPACITY);
+#elif defined(SANITIZER)
+    /// Under sanitizers, use abseil's frame-pointer-based unwinding instead of libunwind.
+    /// libunwind's async stack unwinding is not compatible with sanitizer internals.
+    int captured = absl::GetStackTrace(frame_pointers.data(), static_cast<int>(FRAMEPOINTER_CAPACITY), /* skip_count= */ 0);
+    size = captured > 0 ? static_cast<size_t>(captured) : 0;
 #else
     size = unw_backtrace(frame_pointers.data(), FRAMEPOINTER_CAPACITY);
 #endif
