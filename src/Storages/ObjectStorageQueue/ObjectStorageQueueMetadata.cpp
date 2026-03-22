@@ -47,6 +47,7 @@ namespace ErrorCodes
     extern const int REPLICA_ALREADY_EXISTS;
     extern const int SUPPORT_IS_DISABLED;
     extern const int TIMEOUT_EXCEEDED;
+    extern const int UNEXPECTED_ZOOKEEPER_ERROR;
 }
 
 namespace Setting
@@ -224,6 +225,130 @@ void ObjectStorageQueueMetadata::shutdown()
         cleanup_task->deactivate();
     if (update_registry_thread && update_registry_thread->joinable())
         update_registry_thread->join();
+}
+
+ObjectStorageQueueMetadata::PathState ObjectStorageQueueMetadata::getPathState(
+    const std::string & path,
+    std::string & failure_message) const
+{
+    auto component_guard = Coordination::setCurrentComponent("ObjectStorageQueueMetadata::getPathState");
+    const auto node_name = ObjectStorageQueueIFileMetadata::getNodeName(path);
+    const auto failed_node_path = (zookeeper_path / "failed" / node_name).string();
+    const auto flush_status_node_path = (zookeeper_path / "flush_status" / node_name).string();
+
+    /// Check the exact per-file flush_status node first (written atomically
+    /// with every final success or failure commit by new-code background threads).
+    /// This is the primary signal: it provides exact per-path semantics without
+    /// the pointer-comparison false-positives of ordered mode.
+    {
+        std::string data;
+        bool exists = false;
+        getKeeperRetriesControl(log).retryLoop([&]
+        {
+            exists = getZooKeeper()->tryGet(flush_status_node_path, data);
+        });
+        if (exists)
+        {
+            /// Empty last_exception  → success; non-empty → failure.
+            if (!data.empty())
+            {
+                auto meta = ObjectStorageQueueIFileMetadata::NodeMetadata::fromString(data);
+                if (!meta.last_exception.empty())
+                {
+                    failure_message = meta.last_exception;
+                    return PathState::Failed;
+                }
+            }
+            return PathState::Processed;
+        }
+    }
+
+    /// flush_status does not exist yet — fall back to the legacy node checks
+    /// for backward compatibility with files committed before the feature was
+    /// introduced.
+
+    if (mode == ObjectStorageQueueMode::ORDERED)
+    {
+        /// Delegate to ObjectStorageQueueOrderedFileMetadata::getProcessingStateFromKeeper,
+        /// which handles all sub-cases: global vs per-bucket pointer, plain vs partitioned
+        /// (HIVE/REGEX), and proper Keeper safety checks.
+
+        const size_t effective_buckets = useBucketsForProcessing() ? buckets_num : 1;
+        const auto bucket = ObjectStorageQueueOrderedFileMetadata::getBucketForPath(
+            path, effective_buckets, bucketing_mode, partitioning_mode, filename_parser.get());
+        const auto processed_node_path = useBucketsForProcessing()
+            ? (zookeeper_path / "buckets" / toString(bucket) / "processed").string()
+            : (zookeeper_path / "processed").string();
+
+        /// For HIVE/REGEX partitioned queues the "last processed" pointer is stored under
+        /// a partition-specific child of the processed node rather than in the node itself.
+        std::optional<std::string> partition_processed_path;
+        const auto partition_key = ObjectStorageQueueOrderedFileMetadata::getPartitionKey(
+            path, partitioning_mode, filename_parser.get());
+        if (!partition_key.empty())
+            partition_processed_path = (fs::path(processed_node_path) / partition_key).string();
+
+        auto state = ObjectStorageQueueOrderedFileMetadata::getProcessingStateFromKeeper(
+            nullptr,
+            processed_node_path,
+            path,
+            partition_processed_path,
+            failed_node_path,
+            log,
+            zookeeper_name);
+
+        if (state.is_failed)
+        {
+            failure_message = state.failure_message;
+            return PathState::Failed;
+        }
+        if (state.is_processed)
+            return PathState::AdvancedWithoutExactStatus;
+    }
+    else
+    {
+        /// For unordered mode each processed/failed file gets its own dedicated node.
+        const auto processed_node_path = (zookeeper_path / "processed" / node_name).string();
+        const std::vector<std::string> paths = {processed_node_path, failed_node_path};
+
+        /// Retry covers only the ZK round-trip, matching the pattern in
+        /// ObjectStorageQueueOrderedFileMetadata::getProcessingStateFromKeeper.
+        zkutil::ZooKeeper::MultiTryGetResponse responses;
+        getKeeperRetriesControl(log).retryLoop([&]
+        {
+            responses = getZooKeeper()->tryGet(paths);
+        });
+
+        /// Guardrails: prove the response vector is the right size, then check every
+        /// error code before touching any element — same pattern as the ordered helper.
+        if (responses.size() != paths.size())
+            throw Exception(ErrorCodes::UNEXPECTED_ZOOKEEPER_ERROR,
+                "Unexpected size of Keeper response: expected {}, got {}",
+                paths.size(), responses.size());
+        for (size_t i = 0; i < responses.size(); ++i)
+        {
+            const auto err = responses[i].error;
+            if (err != Coordination::Error::ZOK && err != Coordination::Error::ZNONODE)
+                throw zkutil::KeeperException::fromPath(err, paths[i]);
+        }
+
+        if (responses[0].error == Coordination::Error::ZOK)
+            return PathState::Processed;
+
+        if (responses[1].error == Coordination::Error::ZOK)
+        {
+            if (!responses[1].data.empty())
+                failure_message = ObjectStorageQueueIFileMetadata::NodeMetadata::fromString(responses[1].data).last_exception;
+            return PathState::Failed;
+        }
+    }
+
+    return PathState::Unknown;
+}
+
+std::string ObjectStorageQueueMetadata::getFlushStatusNodePath(const std::string & path) const
+{
+    return (zookeeper_path / "flush_status" / ObjectStorageQueueIFileMetadata::getNodeName(path)).string();
 }
 
 ObjectStorageQueueMetadata::FileMetadataPtr ObjectStorageQueueMetadata::getFileMetadata(
@@ -559,6 +684,16 @@ ObjectStorageQueueTableMetadata ObjectStorageQueueMetadata::syncWithKeeper(
             {
                 table_metadata.adjustFromKeeper(metadata_from_zk.value());
                 table_metadata.checkEquals(metadata_from_zk.value());
+                /// Backfill any metadata subpaths added in later versions
+                /// (e.g. `flush_status` introduced alongside FLUSH command).
+                /// tryCreate is a no-op if the node already exists.
+                for (const auto & sub_path : metadata_paths)
+                {
+                    const auto full_path = (zookeeper_path / sub_path).string();
+                    const auto create_code = zk_client->tryCreate(full_path, "", zkutil::CreateMode::Persistent);
+                    if (create_code != Coordination::Error::ZOK && create_code != Coordination::Error::ZNODEEXISTS)
+                        throw zkutil::KeeperException::fromPath(create_code, full_path);
+                }
                 return;
             }
 

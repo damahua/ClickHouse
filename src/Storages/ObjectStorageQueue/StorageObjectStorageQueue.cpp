@@ -8,6 +8,7 @@
 #include <IO/CompressionMethod.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/ProcessList.h>
 #include <Interpreters/InterpreterInsertQuery.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTFunction.h>
@@ -21,7 +22,9 @@
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/AlterCommands.h>
 #include <Storages/ObjectStorage/Utils.h>
+#include <Storages/ObjectStorageQueue/ObjectStorageQueueIFileMetadata.h>
 #include <Storages/ObjectStorageQueue/ObjectStorageQueueMetadata.h>
+#include <Storages/ObjectStorageQueue/ObjectStorageQueueOrderedFileMetadata.h>
 #include <Storages/StreamingStorageRegistry.h>
 #include <Storages/ObjectStorageQueue/ObjectStorageQueueSettings.h>
 #include <Storages/ObjectStorageQueue/ObjectStorageQueueTableMetadata.h>
@@ -34,11 +37,15 @@
 #include <Common/FailPoint.h>
 #include <Common/Macros.h>
 #include <Common/ProfileEvents.h>
+#include <Common/ZooKeeper/IKeeper.h>
+#include <Common/ZooKeeper/ZooKeeper.h>
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/ZooKeeper/ZooKeeperRetries.h>
+#include <Common/ZooKeeper/ZooKeeperWithFaultInjection.h>
 #include <Common/randomSeed.h>
 
 #include <filesystem>
+#include <Poco/Event.h>
 
 #include <fmt/ranges.h>
 
@@ -129,6 +136,7 @@ namespace ObjectStorageQueueSetting
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
     extern const int BAD_QUERY_PARAMETER;
     extern const int QUERY_NOT_ALLOWED;
@@ -136,6 +144,7 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
     extern const int FAULT_INJECTED;
     extern const int KEEPER_EXCEPTION;
+    extern const int QUERY_WAS_CANCELLED;
 }
 
 namespace
@@ -1702,6 +1711,114 @@ String StorageObjectStorageQueue::chooseZooKeeperPath(
     if (result_zookeeper_name)
         *result_zookeeper_name = zkutil::extractZooKeeperName(result_zk_path);
     return zkutil::extractZooKeeperPath(result_zk_path, true);
+}
+
+void StorageObjectStorageQueue::waitForPathToBeProcessed(
+    const std::string & path,
+    ContextPtr local_context) const
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageObjectStorageQueue::waitForPathToBeProcessed");
+
+    /// Pre-flight: fail fast for states in which the background thread will
+    /// never make progress, rather than parking the caller indefinitely.
+
+    if (!startup_finished || streaming_tasks.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Cannot wait for path to be processed: background streaming for {} "
+            "has not started yet",
+            getStorageID().getNameForLogs());
+
+    if (getDependencies() == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Cannot wait for path to be processed: table {} has no attached "
+            "materialized views and will not consume any files",
+            getStorageID().getNameForLogs());
+
+    if (getContext()->getS3QueueDisableStreaming())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Cannot wait for path to be processed: streaming is disabled for {}",
+            getStorageID().getNameForLogs());
+
+    const auto flush_status_node_path = files_metadata->getFlushStatusNodePath(path);
+
+    LOG_DEBUG(log, "Waiting for path '{}' to be processed by {}", path, getStorageID().getNameForLogs());
+
+    /// Create the event once outside the loop.  We re-arm watches only when a
+    /// watch actually fires (event was set), not on every 1-second timeout tick.
+    /// Re-registering on every timeout would accumulate stale server-side watches
+    /// for slow or nonexistent paths without any benefit.
+    auto event = std::make_shared<Poco::Event>();
+    bool need_arm = true;
+
+    while (true)
+    {
+        if (shutdown_called || table_is_being_dropped)
+            throw Exception(ErrorCodes::QUERY_WAS_CANCELLED,
+                "Table {} is being dropped or server is shutting down",
+                getStorageID().getNameForLogs());
+
+        /// Respect max_execution_time and KILL QUERY: throws QUERY_WAS_CANCELLED
+        /// on manual kill or when the query's time budget is exhausted.
+        /// This is the only guard against indefinite waits for paths that will
+        /// never be seen by the background thread (e.g. typos, wrong prefixes).
+        if (auto query_status = local_context->getProcessListElementSafe())
+            query_status->checkTimeLimit();
+
+        /// Arm watches only when necessary (first iteration, or after a watch fired).
+        /// Correct watch-then-check ordering to eliminate the TOCTOU gap:
+        ///
+        ///   1. Arm watches first (if need_arm).
+        ///   2. Read state after the watches are in place.
+        ///   3. If done, return.  Otherwise wait for the event.
+        ///
+        /// Any transition that occurs after step 1 will fire the event.
+        /// Any transition that occurred before step 1 will be observed in step 2.
+        if (need_arm)
+        {
+            ObjectStorageQueueMetadata::getKeeperRetriesControl(log).retryLoop([&]
+            {
+                auto zk = files_metadata->getZooKeeper()->getKeeper();
+                /// Watch the exact per-file flush_status node.  It is created atomically
+                /// with the final success or failure commit, so a single watch covers both
+                /// outcomes.  For files committed before the flush_status feature existed
+                /// (backward compat), getPathState falls back to old nodes and we detect
+                /// the transition on the next 1-second poll tick.
+                zk->existsWatch(flush_status_node_path, nullptr, event);
+            });
+            need_arm = false;
+        }
+
+        /// Read state now that every relevant watch is armed.
+        std::string failure_message;
+        const auto state = files_metadata->getPathState(path, failure_message);
+
+        if (state == ObjectStorageQueueMetadata::PathState::Processed
+            || state == ObjectStorageQueueMetadata::PathState::AdvancedWithoutExactStatus)
+        {
+            LOG_DEBUG(log, "Path '{}' has been processed by {}", path, getStorageID().getNameForLogs());
+            return;
+        }
+        if (state == ObjectStorageQueueMetadata::PathState::Failed)
+        {
+            throw Exception(ErrorCodes::ABORTED,
+                "Path '{}' failed to be processed by {}: {}",
+                path, getStorageID().getNameForLogs(), failure_message);
+        }
+
+        /// State is still Unknown.  Block until a watch fires or the session-reconnect
+        /// timeout expires (at which point the watches are still pending and we just
+        /// re-check state without re-arming).
+        constexpr UInt64 watch_timeout_ms = 1000;
+        if (event->tryWait(watch_timeout_ms))
+        {
+            /// A watch fired.  Reset the event and re-arm on the next iteration
+            /// because ZooKeeper watches are one-shot.
+            event->reset();
+            need_arm = true;
+        }
+        /// If tryWait timed out, the watches are still pending on the server.
+        /// Do not re-arm — that would accumulate duplicate watches per iteration.
+    }
 }
 
 }

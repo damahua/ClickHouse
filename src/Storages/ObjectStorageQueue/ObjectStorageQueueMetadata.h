@@ -112,6 +112,33 @@ public:
     /// (rewrites what we write in syncWithKeeper()).
     void alterSettings(const SettingsChanges & changes, const ContextPtr & context);
 
+    enum class PathState
+    {
+        /// The path has been successfully processed.
+        Processed,
+        /// The path has failed processing; the failure message is populated.
+        Failed,
+        /// The path has not been processed yet.
+        Unknown,
+        /// Ordered mode only: the queue pointer has advanced past this path's sort
+        /// position but no exact flush_status node exists for it (e.g. the file was
+        /// processed before the flush_status feature was introduced, or the path was
+        /// never uploaded).  FLUSH treats this as success for backward compatibility.
+        AdvancedWithoutExactStatus,
+    };
+
+    /// Check Keeper to determine whether `path` has already been processed or failed.
+    /// For unordered mode checks the per-file processed/failed nodes.
+    /// For ordered mode compares `path` against the stored last-processed pointer
+    /// (Processed iff path <= last_processed_path), and checks the per-file failed node.
+    /// NOTE: In ordered mode `Processed` does not mean the exact file was read;
+    ///       it means the queue pointer has advanced past the file's sort position.
+    /// Sets `failure_message` when the result is `Failed`.
+    PathState getPathState(const std::string & path, std::string & failure_message) const;
+
+    /// Return the Keeper path of the per-file flush_status node for `path`.
+    std::string getFlushStatusNodePath(const std::string & path) const;
+
     /// Get object storage type: s3, azure, local, etc.
     ObjectStorageType getType() const { return storage_type; }
     /// Get base path to keeper metadata.

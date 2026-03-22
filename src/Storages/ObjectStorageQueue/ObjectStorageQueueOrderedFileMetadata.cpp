@@ -54,7 +54,7 @@ namespace
     }
 
     /// Utility function to extract partition key from file path
-    std::string getPartitionKey(
+    std::string getPartitionKeyImpl(
         const std::string & file_path,
         ObjectStorageQueuePartitioningMode partitioning_mode,
         const ObjectStorageQueueFilenameParser * parser)
@@ -95,7 +95,7 @@ namespace
         /// This ensures files from the same partition always go to the same bucket
         if (bucketing_mode == ObjectStorageQueueBucketingMode::PARTITION)
         {
-            auto partition_key = getPartitionKey(path, partitioning_mode, parser);
+            auto partition_key = getPartitionKeyImpl(path, partitioning_mode, parser);
             return sipHash64(partition_key) % buckets_num;
         }
 
@@ -308,6 +308,7 @@ ObjectStorageQueueOrderedFileMetadata::ObjectStorageQueueOrderedFileMetadata(
         /* processing_node_path */zk_path_ / "processing" / getNodeName(path_),
         /* processed_node_path */getProcessedPath(zk_path_, path_, buckets_num_, bucketing_mode_, partitioning_mode_, parser_),
         /* failed_node_path */zk_path_ / "failed" / getNodeName(path_),
+        /* flush_status_node_path */zk_path_ / "flush_status" / getNodeName(path_),
         file_status_,
         max_loading_retries_,
         metadata_ref_count_,
@@ -334,14 +335,14 @@ std::vector<std::string> ObjectStorageQueueOrderedFileMetadata::getMetadataPaths
 {
     if (DB::useBucketsForProcessing(buckets_num))
     {
-        std::vector<std::string> paths{"buckets", "failed", "processing", "persistent_processing"};
+        std::vector<std::string> paths{"buckets", "failed", "processing", "persistent_processing", "flush_status"};
         for (size_t i = 0; i < buckets_num; ++i)
             paths.push_back("buckets/" + toString(i));
         return paths;
     }
     /// We do not return "processed" node here,
     /// because we do not want it to be created in advance.
-    return {"failed", "processing", "persistent_processing"};
+    return {"failed", "processing", "persistent_processing", "flush_status"};
 }
 
 bool ObjectStorageQueueOrderedFileMetadata::getMaxProcessedNode(
@@ -377,7 +378,7 @@ ObjectStorageQueueOrderedFileMetadata::getProcessingStateFromKeeper(
         processed_node_path,
         path,
         hasPartitioningMode(partitioning_mode)
-            ? std::optional<std::string>(std::filesystem::path(processed_node_path) / getPartitionKey(path, partitioning_mode, parser))
+            ? std::optional<std::string>(std::filesystem::path(processed_node_path) / getPartitionKeyImpl(path, partitioning_mode, parser))
             : std::nullopt,
         check_failed ? std::optional<std::string>(failed_node_path) : std::nullopt,
         log_,
@@ -437,7 +438,12 @@ ObjectStorageQueueOrderedFileMetadata::getProcessingStateFromKeeper(
     bool is_failed = failed_node_path_.has_value() ? responses[1].error == Coordination::Error::ZOK : false;
 
     if (responses[0].data.empty())
-        return ProcessingStateFromKeeper(is_failed);
+    {
+        ProcessingStateFromKeeper state(is_failed);
+        if (is_failed && !responses[1].data.empty())
+            state.failure_message = NodeMetadata::fromString(responses[1].data).last_exception;
+        return state;
+    }
 
     NodeMetadata result = NodeMetadata::fromString(responses[0].data);
     if (processed_node_stat)
@@ -449,7 +455,18 @@ ObjectStorageQueueOrderedFileMetadata::getProcessingStateFromKeeper(
     else
         last_processed_path = result.file_path;
 
-    return ProcessingStateFromKeeper(file_path, last_processed_path, is_failed);
+    ProcessingStateFromKeeper state(file_path, last_processed_path, is_failed);
+    if (is_failed && !responses[1].data.empty())
+        state.failure_message = NodeMetadata::fromString(responses[1].data).last_exception;
+    return state;
+}
+
+std::string ObjectStorageQueueOrderedFileMetadata::getPartitionKey(
+    const std::string & path_,
+    ObjectStorageQueuePartitioningMode partitioning_mode,
+    const ObjectStorageQueueFilenameParser * parser)
+{
+    return getPartitionKeyImpl(path_, partitioning_mode, parser);
 }
 
 ObjectStorageQueueOrderedFileMetadata::ProcessingStateFromKeeper::ProcessingStateFromKeeper(
@@ -458,7 +475,7 @@ ObjectStorageQueueOrderedFileMetadata::ProcessingStateFromKeeper::ProcessingStat
     bool is_failed_)
     : last_processed_path(last_processed_path_)
     , is_failed(is_failed_)
-    , is_processed(path.empty() || last_processed_path_.empty() ? false : path <= last_processed_path_)
+    , is_processed(!path.empty() && !last_processed_path_.empty() && path <= last_processed_path_)
 {
 }
 
@@ -594,7 +611,7 @@ std::pair<bool, ObjectStorageQueueIFileMetadata::FileStatus::State> ObjectStorag
 
     std::string processed_node_partition_path;
     if (hasPartitioningMode(partitioning_mode))
-        processed_node_partition_path = std::filesystem::path(processed_node_path) / getPartitionKey(path, partitioning_mode, parser);
+        processed_node_partition_path = std::filesystem::path(processed_node_path) / getPartitionKeyImpl(path, partitioning_mode, parser);
 
     const size_t max_num_tries = 100;
     Coordination::Error code;
@@ -792,7 +809,13 @@ void ObjectStorageQueueOrderedFileMetadata::doPrepareProcessedRequests(
     }
 
     if (created_processing_node)
+    {
         requests.push_back(zkutil::makeRemoveRequest(processing_node_path, -1));
+        /// Write exact per-file terminal status for FLUSH to watch.
+        requests.push_back(
+            zkutil::makeCreateRequest(
+                flush_status_node_path, node_metadata.toString(), zkutil::CreateMode::Persistent));
+    }
 }
 
 void ObjectStorageQueueOrderedFileMetadata::prepareProcessedRequestsImpl(
@@ -1001,7 +1024,7 @@ void ObjectStorageQueueOrderedFileMetadata::filterOutProcessedAndFailed(
         {
             if (hasPartitioningMode(partitioning_mode))
             {
-                auto partition_key = getPartitionKey(path, partitioning_mode, parser);
+                auto partition_key = getPartitionKeyImpl(path, partitioning_mode, parser);
                 auto max_processed_file = last_processed_file_map[bucket].find(partition_key);
                 if (max_processed_file != last_processed_file_map[bucket].end()
                     && path <= max_processed_file->second)

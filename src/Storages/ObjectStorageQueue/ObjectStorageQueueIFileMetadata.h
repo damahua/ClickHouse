@@ -99,6 +99,7 @@ public:
         const std::string & processing_node_path_,
         const std::string & processed_node_path_,
         const std::string & failed_node_path_,
+        const std::string & flush_status_node_path_,
         FileStatusPtr file_status_,
         size_t max_loading_retries_,
         std::atomic<size_t> & metadata_ref_count_,
@@ -120,6 +121,7 @@ public:
     const std::string & getProcessorInfo() const { return processor_info; }
 
     static std::string generateProcessingID();
+    static std::string getNodeName(const std::string & path);
 
     virtual bool useBucketsForProcessing() const { return false; }
     virtual size_t getBucket() const { throw Exception(ErrorCodes::LOGICAL_ERROR, "Buckets are not supported"); }
@@ -207,6 +209,7 @@ protected:
     const std::string processing_node_path;
     const std::string processed_node_path;
     const std::string failed_node_path;
+    const std::string flush_status_node_path;
 
     NodeMetadata node_metadata;
     LoggerPtr log;
@@ -221,8 +224,6 @@ protected:
     std::string processor_info;
 
     bool checkProcessingOwnership(std::shared_ptr<ZooKeeperWithFaultInjection> zk_client);
-
-    static std::string getNodeName(const std::string & path);
 
     static NodeMetadata createNodeMetadata(const std::string & path, const std::string & exception = {}, size_t retries = 0);
 
